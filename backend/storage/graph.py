@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Callable
 
@@ -27,9 +28,9 @@ class GraphStore:
         with self._lock:
             if self._db is not None:
                 return self._db
-            graph_path = self._ensure_dir(self.path)
+            self._ensure_dir(os.path.dirname(self.path))
             try:
-                self._db = kuzu.Database(graph_path)
+                self._db = kuzu.Database(self.path)
                 self._conn = kuzu.Connection(self._db)
             except Exception as exc:
                 self._db = None

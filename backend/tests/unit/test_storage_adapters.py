@@ -12,6 +12,13 @@ def _real_storage_classes():
     return sqlite3, sqlite_module.SQLiteStore, settings_module.SettingsStore
 
 
+def _real_graph_store():
+    for module_name in ["kuzu", "storage.graph"]:
+        sys.modules.pop(module_name, None)
+    graph_module = importlib.import_module("storage.graph")
+    return graph_module.GraphStore, graph_module
+
+
 def test_sqlite_store_connects_lazily(tmp_path):
     _sqlite3, SQLiteStore, _SettingsStore = _real_storage_classes()
     calls = []
@@ -47,3 +54,27 @@ def test_sqlite_store_is_compatible_with_sqlite_connection(tmp_path):
         assert isinstance(conn, sqlite3.Connection)
     finally:
         conn.close()
+
+
+def test_graph_store_ensures_parent_without_rewriting_existing_graph_file(tmp_path, monkeypatch):
+    GraphStore, graph_module = _real_graph_store()
+    calls = []
+    graph_path = tmp_path / "graph"
+    graph_path.write_text("existing kuzu database marker")
+
+    class FakeKuzu:
+        class Database:
+            def __init__(self, path):
+                self.path = path
+
+        class Connection:
+            def __init__(self, db):
+                self.db = db
+
+    monkeypatch.setattr(graph_module, "kuzu", FakeKuzu)
+    store = GraphStore(str(graph_path), lambda path: calls.append(path) or path)
+
+    db = store.database()
+
+    assert calls == [str(tmp_path)]
+    assert db.path == str(graph_path)
