@@ -11,7 +11,11 @@ _assets = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
     "JustHireMe", "assets",
 )
-os.makedirs(_assets, exist_ok=True)
+
+
+def _asset_path(filename: str) -> str:
+    os.makedirs(_assets, exist_ok=True)
+    return os.path.join(_assets, filename)
 
 
 class _DocPackage(BaseModel):
@@ -940,7 +944,7 @@ def _render_resume_template(md_text: str, filename: str) -> str:
         used_ratio = (pdf.get_y() - margin_y) / max(1.0, bottom - margin_y)
         return pdf, overflow, used_ratio
 
-    out = os.path.join(_assets, filename)
+    out = _asset_path(filename)
     chosen_pdf = None
     chosen_ratio = 0.0
     for scale in (1.28, 1.22, 1.16, 1.10, 1.04, 0.98, 0.92, 0.86, 0.80, 0.76):
@@ -1146,7 +1150,7 @@ def _render(md_text: str, filename: str, kind: str = "resume") -> str:
             emit(stripped, size("body"))
         return pdf, truncated
 
-    out = os.path.join(_assets, filename)
+    out = _asset_path(filename)
     chosen_pdf = None
     for scale in (1.0, 0.94, 0.88, 0.82, 0.76, 0.70):
         pdf, truncated = build_pdf(scale)

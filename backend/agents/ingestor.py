@@ -2,7 +2,7 @@ import hashlib
 import math
 import re
 import kuzu
-from db.client import vec
+from db.client import get_graph_db, get_vector_store
 from logger import get_logger
 from models.schema import C
 
@@ -56,8 +56,7 @@ def _hash_embedding(text: str, dims: int = 384) -> list[float]:
 
 def _conn():
     """Get a fresh Kuzu connection per call to avoid lock contention."""
-    from db.client import db
-    return kuzu.Connection(db)
+    return kuzu.Connection(get_graph_db())
 
 
 def _put_node(tbl: str, props: dict):
@@ -91,6 +90,7 @@ def _put_vec(name: str, rows: list):
     if not rows:
         return
     ids = [str(row.get("id") or "") for row in rows if row.get("id")]
+    vec = get_vector_store()
     if name in vec.list_tables().tables:
         table = vec.open_table(name)
         if ids:

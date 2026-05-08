@@ -1,7 +1,7 @@
 import os
 import sqlite3 as _sq
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import kuzu
 import lancedb
 from logger import get_logger
@@ -11,10 +11,15 @@ _log = get_logger(__name__)
 _b = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JustHireMe")
 _g, _v = os.path.join(_b, "graph"), os.path.join(_b, "vector")
 sql = os.path.join(_b, "crm.db")
+_db = None
+_conn = None
+_vec = None
+_GRAPH_ERROR = ""
+_SQL_INITIALIZED = False
 
 
 def _utc_timestamp(offset: timedelta | None = None) -> str:
-    value = datetime.now(UTC)
+    value = datetime.now(timezone.utc)
     if offset is not None:
         value += offset
     return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -51,27 +56,8 @@ def _ensure_dir(path: str) -> str:
             return path
 
 
-_b = _ensure_dir(_b)
-_g, _v = os.path.join(_b, "graph"), os.path.join(_b, "vector")
-_v = _ensure_dir(_v)
-
-_GRAPH_ERROR = ""
-try:
-    db = kuzu.Database(_g)
-    conn = kuzu.Connection(db)
-except Exception as exc:
-    db = None
-    conn = None
-    _GRAPH_ERROR = str(exc)
-    _log.warning("graph store disabled: %s", exc)
-
-try:
-    vec: lancedb.LanceDBConnection | _NullVectorStore = lancedb.connect(_v)
-except Exception as exc:
-    _log.warning("vector store disabled: %s", exc)
-    vec = _NullVectorStore()
-
 def _init():
+    conn = get_graph_connection()
     if conn is None:
         return
     for s in [
@@ -94,11 +80,56 @@ def _init():
     ]:
         conn.execute(s)
 
-_init()
+
+def get_graph_db():
+    global _db, _conn, _GRAPH_ERROR
+    if _db is not None:
+        return _db
+    graph_path = _ensure_dir(_g)
+    try:
+        _db = kuzu.Database(graph_path)
+        _conn = kuzu.Connection(_db)
+        _init()
+    except Exception as exc:
+        _db = None
+        _conn = None
+        _GRAPH_ERROR = str(exc)
+        _log.warning("graph store disabled: %s", exc)
+    return _db
+
+
+def get_graph_connection():
+    global _conn
+    if _conn is None:
+        get_graph_db()
+    return _conn
+
+
+def get_vector_store():
+    global _vec
+    if _vec is not None:
+        return _vec
+    vector_path = _ensure_dir(_v)
+    try:
+        _vec = lancedb.connect(vector_path)
+    except Exception as exc:
+        _log.warning("vector store disabled: %s", exc)
+        _vec = _NullVectorStore()
+    return _vec
+
+
+def __getattr__(name: str):
+    if name == "db":
+        return get_graph_db()
+    if name == "conn":
+        return get_graph_connection()
+    if name == "vec":
+        return get_vector_store()
+    raise AttributeError(name)
 
 
 def graph_available() -> bool:
-    return db is not None and conn is not None
+    return get_graph_db() is not None and get_graph_connection() is not None
 
 
 def graph_error() -> str:
@@ -107,6 +138,7 @@ def graph_error() -> str:
 
 def graph_counts() -> dict:
     out = {key: 0 for key in ["candidate", "skill", "project", "experience", "joblead"]}
+    conn = get_graph_connection()
     if conn is None:
         return out
     for t in ["Candidate", "Skill", "Project", "Experience", "JobLead"]:
@@ -119,6 +151,7 @@ def graph_counts() -> dict:
 
 
 def _init_sql():
+    _ensure_dir(_b)
     c = _sq.connect(sql)
     c.executescript("""
         CREATE TABLE IF NOT EXISTS leads(
@@ -190,7 +223,13 @@ def _init_sql():
     c.commit()
     c.close()
 
-_init_sql()
+
+def _connect_sql():
+    global _SQL_INITIALIZED
+    if not _SQL_INITIALIZED:
+        _init_sql()
+        _SQL_INITIALIZED = True
+    return _sq.connect(sql)
 
 
 _LEAD_SELECT_COLUMNS = (
@@ -204,7 +243,7 @@ _LEAD_SELECT_COLUMNS = (
 
 
 def record_event(job_id: str | None, action: str):
-    c = _sq.connect(sql)
+    c = _connect_sql()
     c.execute(
         "INSERT INTO events(job_id,action) VALUES(?,?)",
         ((job_id or "__system__")[:160], str(action or "")[:1000]),
@@ -214,7 +253,7 @@ def record_event(job_id: str | None, action: str):
 
 
 def url_exists(jid: str) -> bool:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     r = c.execute("SELECT 1 FROM leads WHERE job_id=?", (jid,)).fetchone()
     c.close()
     return r is not None
@@ -278,7 +317,7 @@ def save_lead(
         lead["learning_delta"] = int(learning_delta or 0)
         lead["learning_reason"] = learning_reason or ""
 
-    c = _sq.connect(sql)
+    c = _connect_sql()
     c.execute(
         """
         INSERT OR IGNORE INTO leads(
@@ -318,7 +357,7 @@ def update_lead_score(
     gaps: list | None = None,
     preserve_status: bool = False,
 ):
-    c = _sq.connect(sql)
+    c = _connect_sql()
     row = c.execute("SELECT kind,status FROM leads WHERE job_id=?", (jid,)).fetchone()
     kind = row[0] if row else "job"
     current_status = row[1] if row and row[1] else "discovered"
@@ -351,7 +390,7 @@ def update_lead_score(
 
 
 def save_asset_path(jid: str, path: str):
-    c = _sq.connect(sql)
+    c = _connect_sql()
     c.execute(
         "UPDATE leads SET status='approved', asset_path=? WHERE job_id=?",
         (path, jid),
@@ -372,7 +411,7 @@ def save_asset_package(
     keyword_coverage: dict | None = None,
 ):
     projects = json.dumps(selected_projects or [])
-    c = _sq.connect(sql)
+    c = _connect_sql()
     meta_row = c.execute("SELECT source_meta FROM leads WHERE job_id=?", (jid,)).fetchone()
     source_meta = _json_dict(meta_row[0] if meta_row else "{}")
     if keyword_coverage:
@@ -390,7 +429,7 @@ def save_asset_package(
 
 
 def save_contact_lookup(jid: str, contact_lookup: dict | None):
-    c = _sq.connect(sql)
+    c = _connect_sql()
     row = c.execute("SELECT source_meta FROM leads WHERE job_id=?", (jid,)).fetchone()
     source_meta = _json_dict(row[0] if row else "{}")
     source_meta["contact_lookup"] = contact_lookup or {"status": "empty", "contacts": []}
@@ -407,7 +446,7 @@ def save_contact_lookup(jid: str, contact_lookup: dict | None):
 
 
 def mark_applied(jid: str):
-    c = _sq.connect(sql)
+    c = _connect_sql()
     c.execute("UPDATE leads SET status='applied' WHERE job_id=?", (jid,))
     c.execute(
         "INSERT INTO events(job_id,action) VALUES(?,?)",
@@ -418,7 +457,7 @@ def mark_applied(jid: str):
 
 
 def get_all_leads() -> list:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     rows = c.execute(
         f"SELECT {_LEAD_SELECT_COLUMNS} FROM leads ORDER BY created_at DESC"
     ).fetchall()
@@ -472,7 +511,7 @@ def _lead_row_dict(r) -> dict:
 
 
 def get_all_freelance_leads() -> list:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     rows = c.execute(
         f"SELECT {_LEAD_SELECT_COLUMNS} FROM leads WHERE kind='freelance' ORDER BY created_at DESC"
     ).fetchall()
@@ -481,7 +520,7 @@ def get_all_freelance_leads() -> list:
 
 
 def get_job_leads_for_evaluation() -> list:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     rows = c.execute(
         f"""
         SELECT {_LEAD_SELECT_COLUMNS}
@@ -620,7 +659,7 @@ def lead_cleanup_reasons(lead: dict) -> list[str]:
 
 def cleanup_bad_leads(limit: int = 1000, dry_run: bool = False) -> dict:
     limit = max(1, min(int(limit or 1000), 5000))
-    c = _sq.connect(sql)
+    c = _connect_sql()
     rows = c.execute(
         f"""
         SELECT {_LEAD_SELECT_COLUMNS}
@@ -668,7 +707,7 @@ def cleanup_bad_leads(limit: int = 1000, dry_run: bool = False) -> dict:
 
 
 def get_feedback_training_examples(limit: int = 300) -> list[dict]:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     rows = c.execute(
         """
         SELECT feedback,platform,company,kind,signal_tags,tech_stack,source_meta,
@@ -727,7 +766,7 @@ def recompute_learning_scores(limit: int = 500) -> int:
     if not examples:
         return 0
 
-    c = _sq.connect(sql)
+    c = _connect_sql()
     rows = c.execute(
         f"""
         SELECT {_LEAD_SELECT_COLUMNS}
@@ -821,7 +860,7 @@ def _contact_from_text(text: str) -> dict:
 
 
 def get_lead_for_fire(jid: str) -> tuple:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     row = c.execute(
         "SELECT job_id,title,company,url,platform,status,score,reason,match_points,asset_path,description,gaps,cover_letter_path,selected_projects,kind,budget FROM leads WHERE job_id=?",
         (jid,)
@@ -885,7 +924,7 @@ def get_lead_for_fire(jid: str) -> tuple:
 
 
 def save_settings(d: dict):
-    c = _sq.connect(sql)
+    c = _connect_sql()
     for k, v in d.items():
         c.execute("INSERT OR REPLACE INTO settings(key,val) VALUES(?,?)", (k, str(v)))
     c.commit()
@@ -893,21 +932,21 @@ def save_settings(d: dict):
 
 
 def get_settings() -> dict:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     rows = c.execute("SELECT key,val FROM settings").fetchall()
     c.close()
     return {r[0]: r[1] for r in rows}
 
 
 def get_setting(k: str, default: str = "") -> str:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     r = c.execute("SELECT val FROM settings WHERE key=?", (k,)).fetchone()
     c.close()
     return r[0] if r else default
 
 
 def get_lead_by_id(jid: str) -> dict:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     row = c.execute(
         f"SELECT {_LEAD_SELECT_COLUMNS} FROM leads WHERE job_id=?",
         (jid,)
@@ -925,7 +964,7 @@ def get_lead_by_id(jid: str) -> dict:
 
 
 def delete_lead(jid: str):
-    c = _sq.connect(sql)
+    c = _connect_sql()
     cur = c.execute("DELETE FROM leads WHERE job_id=?", (jid,))
     if getattr(cur, "rowcount", 0) == 0:
         c.close()
@@ -943,7 +982,7 @@ def update_lead_status(jid: str, status: str):
     }
     if status not in valid:
         raise ValueError(f"Invalid status: {status}")
-    c = _sq.connect(sql)
+    c = _connect_sql()
     cur = c.execute("UPDATE leads SET status=? WHERE job_id=?", (status, jid))
     if getattr(cur, "rowcount", 0) == 0:
         c.close()
@@ -966,7 +1005,7 @@ def save_lead_feedback(jid: str, feedback: str, note: str = "") -> dict:
     if feedback not in valid:
         raise ValueError(f"Invalid feedback: {feedback}")
 
-    c = _sq.connect(sql)
+    c = _connect_sql()
     row = c.execute("SELECT kind,status FROM leads WHERE job_id=?", (jid,)).fetchone()
     if not row:
         c.close()
@@ -1005,7 +1044,7 @@ def update_lead_followup(jid: str, days: int = 5) -> dict:
     days = max(1, min(int(days or 5), 60))
     due = _utc_timestamp(timedelta(days=days))
     now = _utc_timestamp()
-    c = _sq.connect(sql)
+    c = _connect_sql()
     row = c.execute("SELECT 1 FROM leads WHERE job_id=?", (jid,)).fetchone()
     if not row:
         c.close()
@@ -1022,7 +1061,7 @@ def update_lead_followup(jid: str, days: int = 5) -> dict:
 
 def get_due_followups(limit: int = 25) -> list:
     now = _utc_timestamp()
-    c = _sq.connect(sql)
+    c = _connect_sql()
     rows = c.execute(
         """
         SELECT {columns}
@@ -1038,7 +1077,7 @@ def get_due_followups(limit: int = 25) -> list:
 
 
 def get_events(limit: int = 100, job_id: str | None = None) -> list:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     if job_id:
         rows = c.execute(
             "SELECT job_id,action,ts FROM events WHERE job_id=? ORDER BY ts DESC LIMIT ?",
@@ -1054,7 +1093,7 @@ def get_events(limit: int = 100, job_id: str | None = None) -> list:
 
 
 def get_discovered_leads() -> list:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     rows = c.execute(
         "SELECT job_id,title,company,url,platform,description FROM leads WHERE status='discovered' AND COALESCE(NULLIF(kind, ''), 'job')='job'"
     ).fetchall()
@@ -1063,7 +1102,7 @@ def get_discovered_leads() -> list:
 
 
 def get_discovered_freelance_leads() -> list:
-    c = _sq.connect(sql)
+    c = _connect_sql()
     rows = c.execute(
         "SELECT job_id,title,company,url,platform,description,budget FROM leads WHERE status='discovered' AND kind='freelance'"
     ).fetchall()
@@ -1136,7 +1175,7 @@ def _normal_profile(profile: dict | None) -> dict:
 
 def _load_profile_snapshot() -> dict:
     try:
-        c = _sq.connect(sql)
+        c = _connect_sql()
         row = c.execute("SELECT val FROM settings WHERE key=?", (_PROFILE_SNAPSHOT_KEY,)).fetchone()
         c.close()
         if not row:
@@ -1152,7 +1191,7 @@ def _save_profile_snapshot(profile: dict):
     if not _profile_has_data(profile):
         return
     try:
-        c = _sq.connect(sql)
+        c = _connect_sql()
         c.execute(
             "INSERT OR REPLACE INTO settings(key,val) VALUES(?,?)",
             (_PROFILE_SNAPSHOT_KEY, json.dumps(profile, ensure_ascii=False)),
@@ -1165,7 +1204,7 @@ def _save_profile_snapshot(profile: dict):
 
 def _read_profile_from_graph() -> dict:
     from kuzu import Connection
-    c = Connection(db)
+    c = Connection(get_graph_db())
 
     # 1. Candidate
     r = c.execute("MATCH (n:Candidate) RETURN n.id, n.n, n.s")
@@ -1260,14 +1299,14 @@ def add_skill(n: str, cat: str) -> dict:
     n = str(n or "").strip()
     cat = str(cat or "general").strip() or "general"
     sid = _h(n)
-    c = Connection(db)
+    c = Connection(get_graph_db())
     try:
         c.execute("CREATE (:Skill {id: $id, n: $n, cat: $cat})", {"id": sid, "n": n, "cat": cat})
     except Exception:
-        c = Connection(db)
+        c = Connection(get_graph_db())
         c.execute("MATCH (s:Skill) WHERE s.id = $id SET s.n = $n, s.cat = $cat", {"id": sid, "n": n, "cat": cat})
     # Link to candidate if one exists
-    c2 = Connection(db)
+    c2 = Connection(get_graph_db())
     try:
         c2.execute("MATCH (c:Candidate) RETURN c.id LIMIT 1")
     except Exception:
@@ -1285,7 +1324,7 @@ def update_skill(sid: str, n: str, cat: str) -> dict:
     from kuzu import Connection
     n = str(n or "").strip()
     cat = str(cat or "general").strip() or "general"
-    c = Connection(db)
+    c = Connection(get_graph_db())
     c.execute("MATCH (s:Skill) WHERE s.id = $id SET s.n = $n, s.cat = $cat", {"id": sid, "n": n, "cat": cat})
     try:
         _add_skill_vec(sid, n, cat)
@@ -1298,7 +1337,7 @@ def update_skill(sid: str, n: str, cat: str) -> dict:
 def delete_skill(sid: str):
     from kuzu import Connection
     _delete_vec_rows("skills", [sid])
-    c = Connection(db)
+    c = Connection(get_graph_db())
     c.execute("MATCH (s:Skill) WHERE s.id = $id DETACH DELETE s", {"id": sid})
     refresh_profile_snapshot()
 
@@ -1312,25 +1351,25 @@ def add_experience(role: str, co: str, period: str, d: str) -> dict:
     period = str(period or "").strip()
     d = str(d or "").strip()
     eid = _h(role + co)
-    c = Connection(db)
+    c = Connection(get_graph_db())
     try:
         c.execute(
             "CREATE (:Experience {id: $id, role: $role, co: $co, period: $period, d: $d})",
             {"id": eid, "role": role, "co": co, "period": period, "d": d}
         )
     except Exception:
-        c = Connection(db)
+        c = Connection(get_graph_db())
         c.execute(
             "MATCH (e:Experience) WHERE e.id = $id SET e.role = $role, e.co = $co, e.period = $period, e.d = $d",
             {"id": eid, "role": role, "co": co, "period": period, "d": d}
         )
     # Link to candidate
-    c2 = Connection(db)
+    c2 = Connection(get_graph_db())
     try:
         r = c2.execute("MATCH (c:Candidate) RETURN c.id LIMIT 1")
         if r.has_next():
             cid = r.get_next()[0]
-            c3 = Connection(db)
+            c3 = Connection(get_graph_db())
             c3.execute(
                 "MATCH (a:Candidate {id: $s}), (b:Experience {id: $d}) MERGE (a)-[:WORKED_AS]->(b)",
                 {"s": cid, "d": eid}
@@ -1347,7 +1386,7 @@ def update_experience(eid: str, role: str, co: str, period: str, d: str) -> dict
     co = str(co or "").strip()
     period = str(period or "").strip()
     d = str(d or "").strip()
-    c = Connection(db)
+    c = Connection(get_graph_db())
     c.execute(
         "MATCH (e:Experience) WHERE e.id = $id SET e.role = $role, e.co = $co, e.period = $period, e.d = $d",
         {"id": eid, "role": role, "co": co, "period": period, "d": d}
@@ -1359,7 +1398,7 @@ def update_experience(eid: str, role: str, co: str, period: str, d: str) -> dict
 def delete_experience(eid: str):
     from kuzu import Connection
     refresh_profile_snapshot()
-    c = Connection(db)
+    c = Connection(get_graph_db())
     c.execute("MATCH (e:Experience) WHERE e.id = $id DETACH DELETE e", {"id": eid})
     refresh_profile_snapshot()
 
@@ -1373,25 +1412,25 @@ def add_project(title: str, stack: str, repo: str, impact: str) -> dict:
     repo = str(repo or "").strip()
     impact = str(impact or "").strip()
     pid = _h(title)
-    c = Connection(db)
+    c = Connection(get_graph_db())
     try:
         c.execute(
             "CREATE (:Project {id: $id, title: $title, stack: $stack, repo: $repo, impact: $impact})",
             {"id": pid, "title": title, "stack": stack, "repo": repo, "impact": impact}
         )
     except Exception:
-        c = Connection(db)
+        c = Connection(get_graph_db())
         c.execute(
             "MATCH (p:Project) WHERE p.id = $id SET p.title = $title, p.stack = $stack, p.repo = $repo, p.impact = $impact",
             {"id": pid, "title": title, "stack": stack, "repo": repo, "impact": impact}
         )
     # Link to candidate
-    c2 = Connection(db)
+    c2 = Connection(get_graph_db())
     try:
         r = c2.execute("MATCH (c:Candidate) RETURN c.id LIMIT 1")
         if r.has_next():
             cid = r.get_next()[0]
-            c3 = Connection(db)
+            c3 = Connection(get_graph_db())
             c3.execute(
                 "MATCH (a:Candidate {id: $s}), (b:Project {id: $d}) MERGE (a)-[:BUILT]->(b)",
                 {"s": cid, "d": pid}
@@ -1413,7 +1452,7 @@ def update_project(pid: str, title: str, stack: str, repo: str, impact: str) -> 
     stack = str(stack or "").strip()
     repo = str(repo or "").strip()
     impact = str(impact or "").strip()
-    c = Connection(db)
+    c = Connection(get_graph_db())
     c.execute(
         "MATCH (p:Project) WHERE p.id = $id SET p.title = $title, p.stack = $stack, p.repo = $repo, p.impact = $impact",
         {"id": pid, "title": title, "stack": stack, "repo": repo, "impact": impact}
@@ -1429,7 +1468,7 @@ def update_project(pid: str, title: str, stack: str, repo: str, impact: str) -> 
 def delete_project(pid: str):
     from kuzu import Connection
     _delete_vec_rows("projects", [pid])
-    c = Connection(db)
+    c = Connection(get_graph_db())
     c.execute("MATCH (p:Project) WHERE p.id = $id DETACH DELETE p", {"id": pid})
     refresh_profile_snapshot()
 
@@ -1440,17 +1479,17 @@ def add_education(title: str) -> dict:
     from kuzu import Connection
     title = str(title or "").strip()
     eid = _h(title)
-    c = Connection(db)
+    c = Connection(get_graph_db())
     try:
         c.execute("CREATE (:Education {id: $id, title: $title})", {"id": eid, "title": title})
     except Exception:
         pass  # already exists
-    c2 = Connection(db)
+    c2 = Connection(get_graph_db())
     try:
         r = c2.execute("MATCH (c:Candidate) RETURN c.id LIMIT 1")
         if r.has_next():
             cid = r.get_next()[0]
-            c3 = Connection(db)
+            c3 = Connection(get_graph_db())
             c3.execute(
                 "MATCH (a:Candidate {id: $s}), (b:Education {id: $d}) MERGE (a)-[:HAS_EDUCATION]->(b)",
                 {"s": cid, "d": eid},
@@ -1467,17 +1506,17 @@ def add_certification(title: str) -> dict:
     from kuzu import Connection
     title = str(title or "").strip()
     cid_node = _h(title)
-    c = Connection(db)
+    c = Connection(get_graph_db())
     try:
         c.execute("CREATE (:Certification {id: $id, title: $title})", {"id": cid_node, "title": title})
     except Exception:
         pass  # already exists
-    c2 = Connection(db)
+    c2 = Connection(get_graph_db())
     try:
         r = c2.execute("MATCH (c:Candidate) RETURN c.id LIMIT 1")
         if r.has_next():
             cand_id = r.get_next()[0]
-            c3 = Connection(db)
+            c3 = Connection(get_graph_db())
             c3.execute(
                 "MATCH (a:Candidate {id: $s}), (b:Certification {id: $d}) MERGE (a)-[:HAS_CERTIFICATION]->(b)",
                 {"s": cand_id, "d": cid_node},
@@ -1494,17 +1533,17 @@ def add_achievement(title: str) -> dict:
     from kuzu import Connection
     title = str(title or "").strip()
     aid = _h(title)
-    c = Connection(db)
+    c = Connection(get_graph_db())
     try:
         c.execute("CREATE (:Achievement {id: $id, title: $title})", {"id": aid, "title": title})
     except Exception:
         pass  # already exists
-    c2 = Connection(db)
+    c2 = Connection(get_graph_db())
     try:
         r = c2.execute("MATCH (c:Candidate) RETURN c.id LIMIT 1")
         if r.has_next():
             cand_id = r.get_next()[0]
-            c3 = Connection(db)
+            c3 = Connection(get_graph_db())
             c3.execute(
                 "MATCH (a:Candidate {id: $s}), (b:Achievement {id: $d}) MERGE (a)-[:HAS_ACHIEVEMENT]->(b)",
                 {"s": cand_id, "d": aid},
@@ -1523,18 +1562,18 @@ def update_candidate(name: str, summary: str) -> dict:
     name = str(name or "").strip()
     summary = str(summary or "").strip()
     refresh_profile_snapshot()
-    c = Connection(db)
+    c = Connection(get_graph_db())
     r = c.execute("MATCH (n:Candidate) RETURN n.id LIMIT 1")
     if r.has_next():
         cid = r.get_next()[0]
-        c2 = Connection(db)
+        c2 = Connection(get_graph_db())
         c2.execute(
             "MATCH (n:Candidate {id: $id}) SET n.n = $n, n.s = $s",
             {"id": cid, "n": name, "s": summary}
         )
     else:
         cid = hashlib.md5(name.encode()).hexdigest()[:12]
-        c2 = Connection(db)
+        c2 = Connection(get_graph_db())
         try:
             c2.execute(
                 "CREATE (:Candidate {id: $id, n: $n, s: $s})",
@@ -1553,10 +1592,10 @@ def _delete_vec_rows(table_name: str, ids: list[str]):
     if not ids:
         return
     try:
-        if table_name not in vec.list_tables():
+        if table_name not in get_vector_store().list_tables():
             return
         quoted = ["'" + item.replace("'", "''") + "'" for item in ids]
-        vec.open_table(table_name).delete("id IN (" + ", ".join(quoted) + ")")
+        get_vector_store().open_table(table_name).delete("id IN (" + ", ".join(quoted) + ")")
     except Exception:
         pass
 
@@ -1567,11 +1606,11 @@ def _add_skill_vec(sid: str, n: str, cat: str):
         vecs = _emb([n])
         if vecs:
             rows = [{"id": sid, "n": n, "cat": cat, "vector": vecs[0]}]
-            if "skills" in vec.list_tables():
+            if "skills" in get_vector_store().list_tables():
                 _delete_vec_rows("skills", [sid])
-                vec.open_table("skills").add(rows)
+                get_vector_store().open_table("skills").add(rows)
             else:
-                vec.create_table("skills", data=rows)
+                get_vector_store().create_table("skills", data=rows)
     except Exception:
         pass
 
@@ -1583,10 +1622,10 @@ def _add_project_vec(pid: str, title: str, stack: str, impact: str):
         vecs = _emb([text])
         if vecs:
             rows = [{"id": pid, "title": title, "stack": stack, "impact": impact, "vector": vecs[0]}]
-            if "projects" in vec.list_tables():
+            if "projects" in get_vector_store().list_tables():
                 _delete_vec_rows("projects", [pid])
-                vec.open_table("projects").add(rows)
+                get_vector_store().open_table("projects").add(rows)
             else:
-                vec.create_table("projects", data=rows)
+                get_vector_store().create_table("projects", data=rows)
     except Exception:
         pass
