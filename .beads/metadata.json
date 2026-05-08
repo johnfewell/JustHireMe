@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "JustHireMe",
+  "project_id": "99fdfa0f-9758-4b01-85ac-3f58a36201c2"
+}
