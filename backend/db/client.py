@@ -1,22 +1,22 @@
 import os
-import sqlite3 as _sq
 import json
 from datetime import datetime, timedelta, timezone
-import kuzu
-import lancedb
 from logger import get_logger
-from storage.migrations.runner import apply_migrations
+from storage.graph import GraphStore
+from storage.settings import SettingsStore
+from storage.sqlite import SQLiteStore
+from storage.vectors import VectorStore
 
 _log = get_logger(__name__)
 
 _b = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JustHireMe")
 _g, _v = os.path.join(_b, "graph"), os.path.join(_b, "vector")
 sql = os.path.join(_b, "crm.db")
-_db = None
-_conn = None
-_vec = None
-_GRAPH_ERROR = ""
-_SQL_INITIALIZED = False
+_sqlite_store: SQLiteStore | None = None
+_graph_store: GraphStore | None = None
+_vector_store: VectorStore | None = None
+_settings_store: SettingsStore | None = None
+_GRAPH_SCHEMA_INITIALIZED = False
 
 
 def _utc_timestamp(offset: timedelta | None = None) -> str:
@@ -24,22 +24,6 @@ def _utc_timestamp(offset: timedelta | None = None) -> str:
     if offset is not None:
         value += offset
     return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-class _NullVectorStore:
-    """No-op vector store so profile CRUD never fails because embeddings are unavailable."""
-
-    def list_tables(self):
-        return []
-
-    def create_table(self, *_args, **_kwargs):
-        return None
-
-    def open_table(self, *_args, **_kwargs):
-        return self
-
-    def add(self, *_args, **_kwargs):
-        return None
 
 
 def _ensure_dir(path: str) -> str:
@@ -83,43 +67,27 @@ def _init():
 
 
 def get_graph_db():
-    global _db, _conn, _GRAPH_ERROR
-    if _db is not None:
-        return _db
-    graph_path = _ensure_dir(_g)
-    try:
-        _db = kuzu.Database(graph_path)
-        _conn = kuzu.Connection(_db)
+    global _GRAPH_SCHEMA_INITIALIZED
+    store = _get_graph_store()
+    db = store.database()
+    if db is not None and not _GRAPH_SCHEMA_INITIALIZED:
         _init()
-    except Exception as exc:
-        _db = None
-        _conn = None
-        _GRAPH_ERROR = str(exc)
-        _log.warning("graph store disabled: %s", exc)
-    return _db
+        _GRAPH_SCHEMA_INITIALIZED = True
+    if store.error:
+        _log.warning("graph store disabled: %s", store.error)
+    return db
 
 
 def get_graph_connection():
-    global _conn
-    if _conn is None:
-        get_graph_db()
-    return _conn
+    return _get_graph_store().shared_connection()
 
 
 def get_vector_store():
-    global _vec
-    if _vec is not None:
-        return _vec
-    vector_path = _ensure_dir(_v)
-    try:
-        _vec = lancedb.connect(vector_path)
-    except Exception as exc:
-        _log.warning("vector store disabled: %s", exc)
-        _vec = _NullVectorStore()
-    return _vec
+    return _get_vector_store().store()
 
 
 def __getattr__(name: str):
+    # TODO(migration): remove in phase 5
     if name == "db":
         return get_graph_db()
     if name == "conn":
@@ -134,7 +102,7 @@ def graph_available() -> bool:
 
 
 def graph_error() -> str:
-    return _GRAPH_ERROR
+    return _get_graph_store().error
 
 
 def graph_counts() -> dict:
@@ -151,19 +119,37 @@ def graph_counts() -> dict:
     return out
 
 
-def _init_sql():
-    _ensure_dir(_b)
-    c = _sq.connect(sql)
-    apply_migrations(c)
-    c.close()
+def _get_sqlite_store() -> SQLiteStore:
+    global _sqlite_store
+    if _sqlite_store is None:
+        _sqlite_store = SQLiteStore(sql, _ensure_dir)
+    return _sqlite_store
+
+
+def _get_graph_store() -> GraphStore:
+    global _graph_store
+    if _graph_store is None:
+        _graph_store = GraphStore(_g, _ensure_dir)
+    return _graph_store
+
+
+def _get_vector_store() -> VectorStore:
+    global _vector_store
+    if _vector_store is None:
+        _vector_store = VectorStore(_v, _ensure_dir)
+    return _vector_store
+
+
+def _get_settings_store() -> SettingsStore:
+    global _settings_store
+    if _settings_store is None:
+        _settings_store = SettingsStore(_get_sqlite_store())
+    return _settings_store
 
 
 def _connect_sql():
-    global _SQL_INITIALIZED
-    if not _SQL_INITIALIZED:
-        _init_sql()
-        _SQL_INITIALIZED = True
-    return _sq.connect(sql)
+    # TODO(migration): remove in phase 5
+    return _get_sqlite_store().connect()
 
 
 _LEAD_SELECT_COLUMNS = (
@@ -858,25 +844,15 @@ def get_lead_for_fire(jid: str) -> tuple:
 
 
 def save_settings(d: dict):
-    c = _connect_sql()
-    for k, v in d.items():
-        c.execute("INSERT OR REPLACE INTO settings(key,val) VALUES(?,?)", (k, str(v)))
-    c.commit()
-    c.close()
+    _get_settings_store().save_many(d)
 
 
 def get_settings() -> dict:
-    c = _connect_sql()
-    rows = c.execute("SELECT key,val FROM settings").fetchall()
-    c.close()
-    return {r[0]: r[1] for r in rows}
+    return _get_settings_store().all()
 
 
 def get_setting(k: str, default: str = "") -> str:
-    c = _connect_sql()
-    r = c.execute("SELECT val FROM settings WHERE key=?", (k,)).fetchone()
-    c.close()
-    return r[0] if r else default
+    return _get_settings_store().text(k, default)
 
 
 def get_lead_by_id(jid: str) -> dict:
