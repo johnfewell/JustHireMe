@@ -784,29 +784,15 @@ async def generate_for_lead(job_id: str, bt: BackgroundTasks):
 
 @app.post("/api/v1/leads/{job_id}/pipeline/run")
 async def run_pipeline(job_id: str, bt: BackgroundTasks):
-    from db.client import get_lead_by_id, get_profile, get_settings
-    from graph import PipelineState, eval_graph
+    from app.services.generation import prepare_pipeline_state
+    from graph import eval_graph
 
-    lead = await asyncio.to_thread(get_lead_by_id, job_id)
-    if not lead:
+    try:
+        state = await asyncio.to_thread(prepare_pipeline_state, job_id)
+    except LookupError:
         raise HTTPException(status_code=404, detail="lead not found")
-    profile = await asyncio.to_thread(get_profile)
-    cfg = await asyncio.to_thread(get_settings)
 
     async def _run():
-        state: PipelineState = {
-            "job_id": job_id,
-            "lead": lead,
-            "profile": profile,
-            "cfg": cfg,
-            "score": 0,
-            "reason": "",
-            "match_points": [],
-            "gaps": [],
-            "asset_path": "",
-            "cover_letter_path": "",
-            "error": None,
-        }
         result = await asyncio.to_thread(eval_graph.invoke, state)
         await cm.broadcast({
             "type": "agent",
@@ -822,34 +808,20 @@ async def run_pipeline(job_id: str, bt: BackgroundTasks):
 
 @app.get("/api/v1/leads/{job_id}/pdf")
 async def get_lead_pdf(job_id: str, kind: str = "resume", version: int | None = None):
-    from fastapi import HTTPException
+    from app.services.generation import resolve_lead_pdf
     from fastapi.responses import FileResponse
-    from db.client import get_lead_by_id
-    lead = get_lead_by_id(job_id)
-    if not lead:
+
+    try:
+        path, filename = resolve_lead_pdf(
+            job_id,
+            kind,
+            version,
+            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+        )
+    except LookupError:
         raise HTTPException(status_code=404, detail="Lead not found")
-    is_cover = kind in {"cover", "cover_letter", "cover-letter"}
-    if version is not None:
-        paths = [
-            lead.get("resume_asset") or lead.get("asset") or "",
-            lead.get("cover_letter_asset") or "",
-        ]
-        base_dir = next((os.path.dirname(path) for path in paths if path), None)
-        if not base_dir:
-            base_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JustHireMe", "assets")
-        filename = f"{job_id}_cl_v{version}.pdf" if is_cover else f"{job_id}_v{version}.pdf"
-        path = os.path.join(base_dir, filename)
-        missing = "Cover letter not generated yet" if is_cover else "Resume not generated yet"
-    elif is_cover:
-        path = lead.get("cover_letter_asset") or ""
-        filename = f"{job_id}_cover_letter.pdf"
-        missing = "Cover letter not generated yet"
-    else:
-        path = lead.get("resume_asset") or lead.get("asset") or ""
-        filename = f"{job_id}_resume.pdf"
-        missing = "Resume not generated yet"
-    if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail=missing)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     return FileResponse(path, media_type="application/pdf", filename=filename)
 
 
