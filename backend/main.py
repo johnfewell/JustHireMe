@@ -1,6 +1,4 @@
 import asyncio
-import csv
-import io
 import json
 import os
 import re
@@ -654,106 +652,64 @@ async def health():
 
 
 def _annotate_job_lead(lead: dict) -> dict:
-    from agents.scout import classify_job_seniority
+    from app.services.leads import annotate_job_lead
 
-    meta = dict(lead.get("source_meta") or {})
-    level = str(meta.get("seniority_level") or lead.get("seniority_level") or "").strip().lower()
-    if level not in {"fresher", "junior", "mid", "senior", "unknown"}:
-        level = classify_job_seniority(lead)
-    meta["seniority_level"] = level
-    meta["is_beginner"] = level in {"fresher", "junior"}
-    return {**lead, "source_meta": meta, "seniority_level": level}
+    return annotate_job_lead(lead)
 
 
 @app.get("/api/v1/leads")
 async def leads(beginner_only: bool = False, seniority: str | None = None):
-    from db.client import get_all_leads
+    from app.services.leads import list_job_leads
 
-    jobs = [_annotate_job_lead(lead) for lead in get_all_leads() if (lead.get("kind") or "job") == "job"]
-    requested = str(seniority or "").strip().lower()
-    if beginner_only or requested == "beginner":
-        return [lead for lead in jobs if lead.get("seniority_level") in {"fresher", "junior"}]
-    if requested in {"fresher", "junior", "mid", "senior", "unknown"}:
-        return [lead for lead in jobs if lead.get("seniority_level") == requested]
-    return jobs
+    return list_job_leads(beginner_only, seniority)
 
 
 @app.get("/api/v1/leads/export.csv")
 async def export_leads_csv():
-    from db.client import get_all_leads
+    from app.services.leads import export_leads_csv as _export_leads_csv
 
-    rows = get_all_leads()
-    fields = [
-        "job_id", "title", "company", "url", "platform", "status",
-        "score", "signal_score", "seniority_level", "location",
-        "reason", "created_at",
-    ]
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(rows)
-    buf.seek(0)
     return StreamingResponse(
-        iter([buf.getvalue()]),
+        iter([_export_leads_csv()]),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=jhm_pipeline.csv"},
     )
 
 
 def _versioned_assets(job_id: str, base_dir: str) -> list[dict]:
-    versions: dict[int, dict] = {}
-    patterns = [
-        ("resume", re.compile(rf"^{re.escape(job_id)}_v(\d+)\.pdf$")),
-        ("cover_letter", re.compile(rf"^{re.escape(job_id)}_cl_v(\d+)\.pdf$")),
-    ]
-    try:
-        names = os.listdir(base_dir)
-    except Exception:
-        return []
-    for name in names:
-        full = os.path.join(base_dir, name)
-        if not os.path.isfile(full):
-            continue
-        for key, pattern in patterns:
-            match = pattern.match(name)
-            if match:
-                version = int(match.group(1))
-                versions.setdefault(version, {"version": version})[key] = full
-    return [versions[v] for v in sorted(versions, reverse=True)]
+    from app.services.leads import versioned_assets
+
+    return versioned_assets(job_id, base_dir)
 
 
 @app.get("/api/v1/leads/{job_id}/versions")
 async def get_lead_versions(job_id: str):
-    from db.client import get_lead_by_id
+    from app.services.leads import lead_versions
 
-    lead = get_lead_by_id(job_id)
-    if not lead:
+    try:
+        return lead_versions(
+            job_id,
+            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+        )
+    except LookupError:
         raise HTTPException(status_code=404, detail="Lead not found")
-    paths = [
-        lead.get("resume_asset") or lead.get("asset") or "",
-        lead.get("cover_letter_asset") or "",
-    ]
-    base_dir = next((os.path.dirname(path) for path in paths if path), None)
-    if not base_dir:
-        base_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JustHireMe", "assets")
-    return _versioned_assets(job_id, base_dir)
 
 
 @app.get("/api/v1/leads/{job_id}")
 async def get_lead(job_id: str):
-    from db.client import get_lead_by_id
-    from fastapi import HTTPException
-    lead = get_lead_by_id(job_id)
-    if not lead:
+    from app.services.leads import get_job_lead
+
+    try:
+        return get_job_lead(job_id)
+    except LookupError:
         raise HTTPException(status_code=404, detail="Lead not found")
-    return _annotate_job_lead(lead) if (lead.get("kind") or "job") == "job" else lead
 
 
 @app.delete("/api/v1/leads/{job_id}")
 async def delete_lead_endpoint(job_id: str):
-    from db.client import delete_lead
+    from app.services.leads import delete_job_lead
+
     try:
-        delete_lead(job_id)
+        delete_job_lead(job_id)
     except LookupError:
         raise HTTPException(status_code=404, detail="lead not found")
     return {"ok": True}
@@ -761,9 +717,10 @@ async def delete_lead_endpoint(job_id: str):
 
 @app.put("/api/v1/leads/{job_id}/status")
 async def update_status(job_id: str, body: StatusBody):
-    from db.client import update_lead_status
+    from app.services.leads import update_job_status
+
     try:
-        update_lead_status(job_id, body.status)
+        update_job_status(job_id, body.status)
         await cm.broadcast({"type": "LEAD_UPDATED", "data": {"job_id": job_id, "status": body.status}})
         return {"ok": True}
     except LookupError:
@@ -774,12 +731,13 @@ async def update_status(job_id: str, body: StatusBody):
 
 @app.put("/api/v1/leads/{job_id}/feedback")
 async def update_feedback(job_id: str, body: FeedbackBody):
-    from db.client import save_lead_feedback
+    from app.services.leads import save_job_feedback
+
     try:
-        lead = save_lead_feedback(job_id, body.feedback, body.note)
+        lead = save_job_feedback(job_id, body.feedback, body.note)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not lead:
+    except LookupError:
         raise HTTPException(status_code=404, detail="Lead not found")
     await cm.broadcast({"type": "LEAD_UPDATED", "data": lead})
     return lead
@@ -787,9 +745,11 @@ async def update_feedback(job_id: str, body: FeedbackBody):
 
 @app.put("/api/v1/leads/{job_id}/followup")
 async def update_followup(job_id: str, body: FollowupBody):
-    from db.client import update_lead_followup
-    lead = update_lead_followup(job_id, body.days)
-    if not lead:
+    from app.services.leads import update_job_followup
+
+    try:
+        lead = update_job_followup(job_id, body.days)
+    except LookupError:
         raise HTTPException(status_code=404, detail="Lead not found")
     await cm.broadcast({"type": "LEAD_UPDATED", "data": lead})
     return lead
@@ -797,51 +757,23 @@ async def update_followup(job_id: str, body: FollowupBody):
 
 @app.post("/api/v1/leads/manual")
 async def create_manual_lead(body: ManualLeadBody):
-    if not body.text.strip() and not body.url.strip():
-        raise HTTPException(status_code=400, detail="Paste lead text or a URL")
-    from agents.lead_intel import manual_lead_from_text
-    from db.client import get_lead_by_id, rank_lead_by_feedback, save_lead
+    from app.services.leads import create_manual_job_lead
 
-    lead = rank_lead_by_feedback(manual_lead_from_text(body.text, body.url, "job"))
-    if lead.get("kind") != "job":
+    try:
+        saved = create_manual_job_lead(body.text, body.url)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Paste lead text or a URL")
+    except TypeError:
         raise HTTPException(status_code=422, detail="Only job leads are accepted right now")
-    lead = _annotate_job_lead(lead)
-    save_lead(
-        lead["job_id"],
-        lead["title"],
-        lead["company"],
-        lead["url"],
-        lead["platform"],
-        lead["description"],
-        kind=lead["kind"],
-        budget=lead["budget"],
-        signal_score=lead["signal_score"],
-        signal_reason=lead["signal_reason"],
-        signal_tags=lead["signal_tags"],
-        outreach_reply=lead["outreach_reply"],
-        outreach_dm=lead["outreach_dm"],
-        outreach_email=lead.get("outreach_email", ""),
-        proposal_draft=lead.get("proposal_draft", ""),
-        fit_bullets=lead.get("fit_bullets", []),
-        followup_sequence=lead.get("followup_sequence", []),
-        proof_snippet=lead.get("proof_snippet", ""),
-        tech_stack=lead.get("tech_stack", []),
-        location=lead.get("location", ""),
-        urgency=lead.get("urgency", ""),
-        base_signal_score=lead.get("base_signal_score"),
-        learning_delta=lead.get("learning_delta"),
-        learning_reason=lead.get("learning_reason", ""),
-        source_meta=lead["source_meta"],
-    )
-    saved = get_lead_by_id(lead["job_id"]) or lead
     await cm.broadcast({"type": "LEAD_UPDATED", "data": saved})
     return saved
 
 
 @app.get("/api/v1/followups/due")
 async def due_followups(limit: int = 25):
-    from db.client import get_due_followups
-    return get_due_followups(limit)
+    from app.services.leads import due_followups as _due_followups
+
+    return _due_followups(limit)
 
 
 @app.post("/api/v1/leads/{job_id}/generate")
@@ -923,116 +855,134 @@ async def get_lead_pdf(job_id: str, kind: str = "resume", version: int | None = 
 
 @app.get("/api/v1/template")
 async def get_template():
-    from db.client import get_setting
-    return {"template": get_setting("resume_template", "")}
+    from app.services.settings import get_resume_template
+
+    return get_resume_template()
 
 
 @app.post("/api/v1/template")
 async def save_template(body: TemplateBody):
-    from db.client import save_settings
-    save_settings({"resume_template": body.template})
-    return {"ok": True}
+    from app.services.settings import save_resume_template
+
+    return save_resume_template(body.template)
 
 
 @app.get("/api/v1/events")
 async def get_events_endpoint(limit: int = 100, job_id: str | None = None):
-    from db.client import get_events
+    from app.services.generation import get_events
+
     return get_events(limit=limit, job_id=job_id)
 
 
 @app.get("/api/v1/graph")
 async def graph_stats():
-    from db.client import graph_counts
-    return graph_counts()
+    from app.services.profile import graph_stats as _graph_stats
+
+    return _graph_stats()
 
 
 @app.get("/api/v1/profile")
 async def get_profile_endpoint():
-    from db.client import get_profile as _gp
-    return _gp()
+    from app.services.profile import get_profile
+
+    return get_profile()
 
 
 @app.put("/api/v1/profile/candidate")
 async def update_candidate_endpoint(body: CandidateBody):
-    from db.client import update_candidate
-    if not body.n.strip() and not body.s.strip():
+    from app.services.profile import update_candidate_profile
+
+    try:
+        return update_candidate_profile(body.n, body.s)
+    except ValueError:
         raise HTTPException(status_code=422, detail="Name or summary is required")
-    return update_candidate(body.n, body.s)
 
 
 # ── Profile CRUD: Skills ──────────────────────────────────────────
 
 @app.post("/api/v1/profile/skill")
 async def add_skill_endpoint(body: SkillBody):
-    from db.client import add_skill
-    if not body.n.strip():
+    from app.services.profile import add_profile_skill
+
+    try:
+        return add_profile_skill(body.n, body.cat)
+    except ValueError:
         raise HTTPException(status_code=422, detail="Skill name is required")
-    return add_skill(body.n, body.cat)
 
 
 @app.put("/api/v1/profile/skill/{sid}")
 async def update_skill_endpoint(sid: str, body: SkillBody):
-    from db.client import update_skill
-    if not body.n.strip():
+    from app.services.profile import update_profile_skill
+
+    try:
+        return update_profile_skill(sid, body.n, body.cat)
+    except ValueError:
         raise HTTPException(status_code=422, detail="Skill name is required")
-    return update_skill(sid, body.n, body.cat)
 
 
 @app.delete("/api/v1/profile/skill/{sid}")
 async def delete_skill_endpoint(sid: str):
-    from db.client import delete_skill
-    delete_skill(sid)
-    return {"ok": True}
+    from app.services.profile import delete_profile_skill
+
+    return delete_profile_skill(sid)
 
 
 # ── Profile CRUD: Experience ──────────────────────────────────────
 
 @app.post("/api/v1/profile/experience")
 async def add_experience_endpoint(body: ExperienceBody):
-    from db.client import add_experience
-    if not body.role.strip() and not body.co.strip():
+    from app.services.profile import add_profile_experience
+
+    try:
+        return add_profile_experience(body.role, body.co, body.period, body.d)
+    except ValueError:
         raise HTTPException(status_code=422, detail="Role or company is required")
-    return add_experience(body.role, body.co, body.period, body.d)
 
 
 @app.put("/api/v1/profile/experience/{eid}")
 async def update_experience_endpoint(eid: str, body: ExperienceBody):
-    from db.client import update_experience
-    if not body.role.strip() and not body.co.strip():
+    from app.services.profile import update_profile_experience
+
+    try:
+        return update_profile_experience(eid, body.role, body.co, body.period, body.d)
+    except ValueError:
         raise HTTPException(status_code=422, detail="Role or company is required")
-    return update_experience(eid, body.role, body.co, body.period, body.d)
 
 
 @app.delete("/api/v1/profile/experience/{eid}")
 async def delete_experience_endpoint(eid: str):
-    from db.client import delete_experience
-    delete_experience(eid)
-    return {"ok": True}
+    from app.services.profile import delete_profile_experience
+
+    return delete_profile_experience(eid)
 
 
 # ── Profile CRUD: Projects ───────────────────────────────────────
 
 @app.post("/api/v1/profile/project")
 async def add_project_endpoint(body: ProjectBody):
-    from db.client import add_project
-    if not body.title.strip():
+    from app.services.profile import add_profile_project
+
+    try:
+        return add_profile_project(body.title, body.stack, body.repo, body.impact)
+    except ValueError:
         raise HTTPException(status_code=422, detail="Project title is required")
-    return add_project(body.title, body.stack, body.repo, body.impact)
 
 
 @app.put("/api/v1/profile/project/{pid}")
 async def update_project_endpoint(pid: str, body: ProjectBody):
-    from db.client import update_project
-    if not body.title.strip():
+    from app.services.profile import update_profile_project
+
+    try:
+        return update_profile_project(pid, body.title, body.stack, body.repo, body.impact)
+    except ValueError:
         raise HTTPException(status_code=422, detail="Project title is required")
-    return update_project(pid, body.title, body.stack, body.repo, body.impact)
 
 
 @app.delete("/api/v1/profile/project/{pid}")
 async def delete_project_endpoint(pid: str):
-    from db.client import delete_project
-    delete_project(pid)
-    return {"ok": True}
+    from app.services.profile import delete_profile_project
+
+    return delete_profile_project(pid)
 
 
 @app.post("/api/v1/scan")
@@ -1271,20 +1221,16 @@ async def _run_scan():
 
 def _sensitive(d: dict) -> set:
     """Keys that should be masked on reads and preserved on writes."""
-    fixed = {"anthropic_key", "linkedin_cookie", "x_bearer_token", "custom_connector_headers"}
-    dynamic = {k for k in d if k.endswith("_api_key") or k.endswith("_key") or k.endswith("_token")}
-    return fixed | dynamic
+    from app.services.settings import sensitive_keys
+
+    return sensitive_keys(d)
 
 
 @app.get("/api/v1/settings")
 async def get_cfg():
-    from db.client import get_settings
-    s = get_settings()
-    _m = "••••••••••••••••••••"
-    for k in _sensitive(s):
-        if s.get(k):
-            s[k] = _m
-    return s
+    from app.services.settings import read_masked_settings
+
+    return read_masked_settings()
 
 
 async def _probe_provider_key(provider: str, key: str) -> dict:
@@ -1370,14 +1316,9 @@ async def validate_settings():
 
 @app.post("/api/v1/settings")
 async def save_cfg(body: SettingsBody):
-    from db.client import get_settings, save_settings
-    payload = {k: "" if v is None else str(v) for k, v in body.model_dump().items()}
-    old = get_settings()
-    _m = "••••••••••••••••••••"
-    for k in _sensitive({**old, **payload}):
-        if payload.get(k) == _m:
-            payload[k] = old.get(k, "")
-    save_settings(payload)
+    from app.services.settings import save_settings_payload
+
+    payload = save_settings_payload(body.model_dump())
     ghost = payload.get("ghost_mode") == "true"
     if ghost and not _sched.get_job("ghost"):
         _sched.add_job(_ghost_tick, "interval", hours=6, id="ghost")
