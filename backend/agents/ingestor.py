@@ -91,7 +91,7 @@ def _put_vec(name: str, rows: list):
     if not rows:
         return
     ids = [str(row.get("id") or "") for row in rows if row.get("id")]
-    if name in vec.list_tables():
+    if name in vec.list_tables().tables:
         table = vec.open_table(name)
         if ids:
             quoted = ["'" + item.replace("'", "''") + "'" for item in ids]
@@ -181,11 +181,11 @@ def _vectors(p: C):
 
 def _pdf(path: str) -> str:
     try:
-        from pypdf import PdfReader
-        pages = PdfReader(path).pages
-        text = " ".join(pg.extract_text() or "" for pg in pages)
+        from docling.document_converter import DocumentConverter
+        result = DocumentConverter().convert(path)
+        text = result.document.export_to_markdown()
         if not text.strip():
-            _log.warning("PDF has no extractable text (may be scanned/image-only): %s", path)
+            _log.warning("PDF has no extractable text: %s", path)
         return text
     except Exception as exc:
         _log.error("PDF read error for %s: %s", path, exc)
