@@ -1,9 +1,17 @@
-import sqlite3
+import importlib
+import sys
 
-from storage.migrations.runner import apply_migrations
+
+def _real_sqlite_and_runner():
+    sys.modules.pop("sqlite3", None)
+    sqlite3 = importlib.import_module("sqlite3")
+    sys.modules.pop("storage.migrations.runner", None)
+    runner = importlib.import_module("storage.migrations.runner")
+    return sqlite3, runner.apply_migrations
 
 
 def test_apply_migrations_creates_schema_once():
+    sqlite3, apply_migrations = _real_sqlite_and_runner()
     conn = sqlite3.connect(":memory:")
 
     apply_migrations(conn)

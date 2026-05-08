@@ -1,10 +1,19 @@
-import sqlite3
+import importlib
+import sys
 
-from storage.settings import SettingsStore
-from storage.sqlite import SQLiteStore
+
+def _real_storage_classes():
+    sys.modules.pop("sqlite3", None)
+    sqlite3 = importlib.import_module("sqlite3")
+    for module_name in ["storage.sqlite", "storage.settings"]:
+        sys.modules.pop(module_name, None)
+    sqlite_module = importlib.import_module("storage.sqlite")
+    settings_module = importlib.import_module("storage.settings")
+    return sqlite3, sqlite_module.SQLiteStore, settings_module.SettingsStore
 
 
 def test_sqlite_store_connects_lazily(tmp_path):
+    _sqlite3, SQLiteStore, _SettingsStore = _real_storage_classes()
     calls = []
     db_path = tmp_path / "crm.db"
 
@@ -19,6 +28,7 @@ def test_sqlite_store_connects_lazily(tmp_path):
 
 
 def test_settings_store_exposes_typed_accessors(tmp_path):
+    _sqlite3, SQLiteStore, SettingsStore = _real_storage_classes()
     store = SQLiteStore(str(tmp_path / "crm.db"), lambda path: path)
     settings = SettingsStore(store)
 
@@ -30,6 +40,7 @@ def test_settings_store_exposes_typed_accessors(tmp_path):
 
 
 def test_sqlite_store_is_compatible_with_sqlite_connection(tmp_path):
+    sqlite3, SQLiteStore, _SettingsStore = _real_storage_classes()
     store = SQLiteStore(str(tmp_path / "crm.db"), lambda path: path)
     conn = store.connect()
     try:
