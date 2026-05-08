@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import kuzu
 import lancedb
 from logger import get_logger
+from storage.migrations.runner import apply_migrations
 
 _log = get_logger(__name__)
 
@@ -153,74 +154,7 @@ def graph_counts() -> dict:
 def _init_sql():
     _ensure_dir(_b)
     c = _sq.connect(sql)
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS leads(
-            job_id TEXT PRIMARY KEY, title TEXT, company TEXT,
-            url TEXT, platform TEXT, status TEXT DEFAULT 'discovered',
-            score INTEGER DEFAULT 0,
-            reason TEXT DEFAULT '',
-            match_points TEXT DEFAULT '',
-            asset_path TEXT DEFAULT '',
-            cover_letter_path TEXT DEFAULT '',
-            selected_projects TEXT DEFAULT '',
-            description TEXT DEFAULT '',
-            gaps TEXT DEFAULT '',
-            resume_version INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS events(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_id TEXT, action TEXT, ts TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS settings(
-            key TEXT PRIMARY KEY, val TEXT
-        );
-    """)
-    # Migration: add columns if upgrading from older schema
-    for col, definition in [
-        ("score",        "INTEGER DEFAULT 0"),
-        ("reason",       "TEXT DEFAULT ''"),
-        ("match_points", "TEXT DEFAULT ''"),
-        ("asset_path",   "TEXT DEFAULT ''"),
-        ("cover_letter_path", "TEXT DEFAULT ''"),
-        ("selected_projects", "TEXT DEFAULT ''"),
-        ("description",  "TEXT DEFAULT ''"),
-        ("gaps",         "TEXT DEFAULT ''"),
-        ("kind",         "TEXT DEFAULT 'job'"),
-        ("budget",       "TEXT DEFAULT ''"),
-        ("signal_score", "INTEGER DEFAULT 0"),
-        ("signal_reason", "TEXT DEFAULT ''"),
-        ("signal_tags", "TEXT DEFAULT ''"),
-        ("outreach_reply", "TEXT DEFAULT ''"),
-        ("outreach_dm", "TEXT DEFAULT ''"),
-        ("source_meta", "TEXT DEFAULT ''"),
-        ("feedback", "TEXT DEFAULT ''"),
-        ("feedback_note", "TEXT DEFAULT ''"),
-        ("followup_due_at", "TEXT DEFAULT ''"),
-        ("last_contacted_at", "TEXT DEFAULT ''"),
-        ("outreach_email", "TEXT DEFAULT ''"),
-        ("proposal_draft", "TEXT DEFAULT ''"),
-        ("fit_bullets", "TEXT DEFAULT ''"),
-        ("followup_sequence", "TEXT DEFAULT ''"),
-        ("proof_snippet", "TEXT DEFAULT ''"),
-        ("tech_stack", "TEXT DEFAULT ''"),
-        ("location", "TEXT DEFAULT ''"),
-        ("urgency", "TEXT DEFAULT ''"),
-        ("base_signal_score", "INTEGER DEFAULT 0"),
-        ("learning_delta", "INTEGER DEFAULT 0"),
-        ("learning_reason", "TEXT DEFAULT ''"),
-        ("resume_version", "INTEGER DEFAULT 0"),
-    ]:
-        try:
-            c.execute(f"ALTER TABLE leads ADD COLUMN {col} {definition}")
-        except Exception:
-            pass  # column already exists
-    try:
-        c.execute("ALTER TABLE leads ADD COLUMN resume_version INTEGER DEFAULT 0")
-        c.commit()
-    except Exception:
-        pass  # column already exists
-    c.commit()
+    apply_migrations(c)
     c.close()
 
 

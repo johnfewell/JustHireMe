@@ -43,6 +43,12 @@ Temporary compatibility shims for storage or IPC migrations must include the exa
 rg "# TODO\\(migration\\): remove in phase 5" backend
 ```
 
+## Storage Migrations
+
+SQLite schema changes live in `storage/migrations/` as versioned Python modules named with a zero-padded numeric prefix, for example `0002_add_example.py`. Each migration exposes `apply(conn)` and is applied once by `storage.migrations.runner.apply_migrations` on first SQLite connection.
+
+Migration files run in lexical order. To add a migration, create the next numbered file, keep it idempotent for partially upgraded local databases, and avoid importing app modules from migrations.
+
 ## Notes
 
 The backend stores local user data through SQLite, Kuzu, LanceDB, and generated files. Do not commit local app data, vector stores, graph databases, generated PDFs, API keys, cookies, or private resumes.
