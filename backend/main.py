@@ -1029,26 +1029,21 @@ async def stop_reevaluate_jobs():
 
 @app.post("/api/v1/leads/cleanup")
 async def cleanup_leads(dry_run: bool = False, limit: int = 1000):
-    from db.client import cleanup_bad_leads, get_lead_by_id
+    from app.services.scanning import cleanup_bad_leads, cleanup_done_message
 
     await cm.broadcast({
         "type": "agent",
         "event": "cleanup_start",
         "msg": f"Scanning up to {limit} leads for bad data...",
     })
-    result = await asyncio.to_thread(cleanup_bad_leads, limit, dry_run)
+    result, updated = await asyncio.to_thread(cleanup_bad_leads, dry_run, limit)
 
-    if not dry_run:
-        for item in result.get("items", [])[:100]:
-            lead = await asyncio.to_thread(get_lead_by_id, item["job_id"])
-            if lead:
-                await cm.broadcast({"type": "LEAD_UPDATED", "data": lead})
-
-    action = "would discard" if dry_run else "discarded"
+    for lead in updated:
+        await cm.broadcast({"type": "LEAD_UPDATED", "data": lead})
     await cm.broadcast({
         "type": "agent",
         "event": "cleanup_done",
-        "msg": f"Cleanup scanned {result['scanned']} leads and {action} {result['candidates']} bad rows.",
+        "msg": cleanup_done_message(result, dry_run),
     })
     return result
 
@@ -1064,10 +1059,10 @@ async def free_sources_scan():
 
 @app.post("/api/v1/help/chat")
 async def help_chat(body: HelpChatBody):
-    from agents.help_agent import answer
+    from app.services.scanning import answer_help_question
 
     history = [item.model_dump() for item in body.history]
-    return await asyncio.to_thread(answer, body.question, history)
+    return await asyncio.to_thread(answer_help_question, body.question, history)
 
 
 async def _run_scan_task():
@@ -1527,98 +1522,17 @@ async def ingest_github_endpoint(body: GithubIngestBody):
 
 @app.post("/api/v1/ingest/profile")
 async def import_profile_json(body: ProfileImportBody):
-    errors = []
-    from db.client import (
-        update_candidate, add_skill, add_experience,
-        add_education, add_certification, add_achievement,
-        add_project, save_settings,
-    )
+    from app.services.ingestion import import_profile_data
 
-    stats = {k: 0 for k in [
-        "skills", "experience", "projects", "education",
-        "certifications", "achievements",
-    ]}
-
-    c = body.candidate
-    if c.name or c.summary:
-        try:
-            await asyncio.to_thread(update_candidate, c.name, c.summary)
-        except Exception as e:
-            errors.append(f"candidate: {e}")
-
-    id_ = body.identity
-    identity_map = {
-        "email": id_.email,
-        "phone": id_.phone,
-        "linkedin_url": id_.linkedin_url,
-        "github_url": id_.github_url,
-        "website_url": id_.website_url,
-        "city": id_.city,
-    }
-    for key, val in identity_map.items():
-        if val:
-            try:
-                await asyncio.to_thread(save_settings, {key: val})
-            except Exception as e:
-                errors.append(f"identity.{key}: {e}")
-
-    for s in body.skills:
-        try:
-            await asyncio.to_thread(add_skill, s.name, s.category)
-            stats["skills"] += 1
-        except Exception:
-            pass
-
-    for ex in body.experience:
-        try:
-            await asyncio.to_thread(
-                add_experience, ex.role, ex.company, ex.period, ex.description,
-            )
-            stats["experience"] += 1
-        except Exception as e:
-            errors.append(f"exp {ex.role}: {e}")
-
-    for p in body.projects:
-        try:
-            await asyncio.to_thread(add_project, p.title, p.stack, p.repo, p.impact)
-            stats["projects"] += 1
-        except Exception as e:
-            errors.append(f"proj {p.title}: {e}")
-
-    for e in body.education:
-        try:
-            await asyncio.to_thread(add_education, e.title)
-            stats["education"] += 1
-        except Exception as exc:
-            errors.append(f"edu: {exc}")
-
-    for cert in body.certifications:
-        try:
-            await asyncio.to_thread(add_certification, cert.title)
-            stats["certifications"] += 1
-        except Exception as exc:
-            errors.append(f"cert: {exc}")
-
-    for ach in body.achievements:
-        try:
-            await asyncio.to_thread(add_achievement, ach.title)
-            stats["achievements"] += 1
-        except Exception as exc:
-            errors.append(f"achievement: {exc}")
-
-    return {
-        "status": "ok" if not errors else "partial",
-        "stats": stats,
-        "errors": errors,
-    }
+    return await asyncio.to_thread(import_profile_data, body.model_dump())
 
 
 @app.get("/api/v1/ingest/profile/template")
 async def get_profile_template():
     from pathlib import Path
-    template_path = Path(__file__).parent / "data" / "profile_schema_example.json"
-    with open(template_path, encoding="utf-8") as f:
-        return json.load(f)
+    from app.services.ingestion import load_profile_template
+
+    return load_profile_template(Path(__file__).parent)
 
 
 @app.post("/api/v1/ingest/portfolio")
