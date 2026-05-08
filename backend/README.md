@@ -35,6 +35,14 @@ macOS/Linux:
 backend/.venv/bin/python -m pytest backend/tests
 ```
 
+## Migration Shims
+
+Temporary compatibility shims for storage or IPC migrations must include the exact marker `# TODO(migration): remove in phase 5`. Keep the marker on the shim itself or the smallest enclosing block so cleanup can be verified with:
+
+```bash
+rg "# TODO\\(migration\\): remove in phase 5" backend
+```
+
 ## Notes
 
 The backend stores local user data through SQLite, Kuzu, LanceDB, and generated files. Do not commit local app data, vector stores, graph databases, generated PDFs, API keys, cookies, or private resumes.

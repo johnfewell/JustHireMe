@@ -1,9 +1,36 @@
 import importlib
 import sys
 import types
+from pathlib import Path
 
 
-def test_storage_modules_do_not_open_storage_on_import(monkeypatch):
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+IMPORT_EXCLUDES = {
+    "force_model",
+    "run_diagnostics",
+    "test_ingestion",
+    "test_live_fire",
+    "update_settings",
+}
+
+
+def _backend_modules() -> list[str]:
+    modules = []
+    for path in sorted(BACKEND_ROOT.rglob("*.py")):
+        if any(part in {".venv", "tests"} for part in path.parts):
+            continue
+        relative = path.relative_to(BACKEND_ROOT)
+        if relative.name == "__init__.py":
+            module_name = ".".join(relative.parts[:-1])
+        else:
+            module_name = ".".join(relative.with_suffix("").parts)
+        if not module_name or module_name in IMPORT_EXCLUDES:
+            continue
+        modules.append(module_name)
+    return modules
+
+
+def test_backend_modules_do_not_open_storage_on_import(monkeypatch):
     calls = []
 
     def fail(name):
@@ -31,11 +58,7 @@ def test_storage_modules_do_not_open_storage_on_import(monkeypatch):
     monkeypatch.setitem(sys.modules, "kuzu", fake_kuzu)
     monkeypatch.setitem(sys.modules, "lancedb", fake_lancedb)
 
-    module_names = [
-        "db.client",
-        "agents.generator",
-        "agents.ingestor",
-    ]
+    module_names = _backend_modules()
     try:
         for module_name in module_names:
             sys.modules.pop(module_name, None)
